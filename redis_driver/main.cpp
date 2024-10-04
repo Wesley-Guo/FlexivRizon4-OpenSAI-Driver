@@ -10,12 +10,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <Eigen/Dense>
-#include <franka/duration.h>
-#include <franka/exception.h>
-#include <franka/model.h>
-#include <franka/robot.h>
+
 #include "RedisClient.h"
 #include "ButterworthFilter.h"
+
+#include <flexiv/robot.h>
+#include <flexiv/log.h>
+#include <flexiv/scheduler.h>
+#include <flexiv/utility.h>
+
+#include <iostream>
+#include <string>
+#include <cmath>
+#include <thread>
+#include <atomic>
+
 
 // redis keys
 // - read:
@@ -32,8 +41,7 @@ std::string SENT_TORQUES_LOGGING_KEY;
 std::string CONSTRAINED_NULLSPACE_KEY;
 
 // user options 
-const bool USING_PANDA = false;  // user switch between Panda and FR3
-const bool USING_CONSERVATIVE_FR3 = false;  // true to use rectangular bounds, false to use configuration-based bounds 
+const bool USING_4S = true; // set if using the Rizon 4s with wrist force-torque sensor
 const bool VERBOSE = true;  // print out safety violations
 
 // globals 
@@ -102,6 +110,13 @@ enum Limit {
 
 const std::vector<string> limit_state {"Safe", "Soft Min", "Hard Min", "Soft Max", "Hard Max", "Min Soft Vel", "Min Hard Vel", "Max Soft Vel", "Max Hard Vel"};
 
+/** Joint velocity damping gains for floating */
+const std::array<double, flexiv::kJointDOF> kFloatingDamping
+    = {10.0, 10.0, 5.0, 5.0, 1.0, 1.0, 1.0};
+
+/** Atomic signal to stop scheduler tasks */
+std::atomic<bool> g_stop_sched = {false};
+
 double getBlendingCoeff(const double& val, const double& low, const double& high) {
     return std::clamp((val - low) / (high - low), 0., 1.);
 }
@@ -130,29 +145,81 @@ std::array<double, 7> getMinJointVelocity(std::array<double, 7>& q) {
     return dq_min;
 }
 
+
+/** @brief Print program usage help */
+void PrintHelp()
+{
+    // clang-format off
+    std::cout << "Required arguments: [robot SN]" << std::endl;
+    std::cout << "    robot SN: Serial number of the robot to connect to. "
+                 "Remove any space, for example: Rizon4s-123456" << std::endl;
+    std::cout << "Optional arguments: [--hold]" << std::endl;
+    std::cout << "    --hold: robot holds current joint positions, otherwise do a sine-sweep" << std::endl;
+    std::cout << std::endl;
+    // clang-format on
+}
+
+/** @brief Callback function for realtime periodic task */
+void PeriodicTask(flexiv::Robot& robot, flexiv::Log& log)
+{
+    try {
+        // Monitor fault on the connected robot
+        if (robot.fault()) {
+            throw std::runtime_error(
+                "PeriodicTask: Fault occurred on the connected robot, exiting ...");
+        }
+
+        // Set 0 joint torques
+        std::array<double, flexiv::kJointDOF> target_torque = {};
+
+        // Add some velocity damping
+        for (size_t i = 0; i < flexiv::kJointDOF; ++i) {
+            target_torque[i] += -kFloatingDamping[i] * robot.states().dtheta[i];
+        }
+
+        // Send target joint torque to RDK server, enable gravity compensation and joint limits soft
+        // protection
+        robot.StreamJointTorque(target_torque, true, true);
+
+    } catch (const std::exception& e) {
+        log.Error(e.what());
+        g_stop_sched = true;
+    }
+}
+
+
 int main (int argc, char** argv) {
 
-    if (argc < 2) {
-        std::cout << "Please enter the robot ip as an argument" << "\n";
-        return -1;
+    // Program Setup
+    // =============================================================================================
+    // Logger for printing message with timestamp and coloring
+    flexiv::Log log;
+
+    // Parse parameters
+    if (argc < 2 || flexiv::utility::ProgramArgsExistAny(argc, argv, {"-h", "--help"})) {
+        PrintHelp();
+        return 1;
     }
-    std::string robot_ip = argv[1];
+    // Serial number of the robot to connect to. Remove any space, for example: Rizon4s-123456
+    std::string robot_sn = argv[1];
 
     std::map<string, string> robot_id;
     robot_id[""] = "";
-    robot_id["172.16.0.10"] = "Romeo";
-    robot_id["172.16.0.11"] = "Juliet";
+    // robot_id["172.16.0.10"] = "Romeo";
+    // robot_id["172.16.0.11"] = "Juliet";
+    robot_id["test"] = "4S-Oberon";
+    // robot_id["172.16.0.11"] = "Juliet";
 
-    JOINT_TORQUES_COMMANDED_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::actuators::fgc";
-    JOINT_ANGLES_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::q";
-    JOINT_VELOCITIES_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::dq";
-    JOINT_TORQUES_SENSED_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::torques";
-    MASSMATRIX_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::model::massmatrix";
-    CORIOLIS_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::model::coriolis";
-    ROBOT_GRAVITY_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::model::robot_gravity";
-    SAFETY_TORQUES_LOGGING_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::safety::safety_torques";
-    SENT_TORQUES_LOGGING_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::safety::sent_torques";
-    CONSTRAINED_NULLSPACE_KEY = "sai2::FrankaPanda::" + robot_id[robot_ip] + "::sensors::model::constraint_nullspace";
+    JOINT_TORQUES_COMMANDED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::actuators::fgc";
+    JOINT_ANGLES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::q";
+    JOINT_VELOCITIES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::dq";
+    JOINT_TORQUES_SENSED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::torques";
+    MASSMATRIX_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::massmatrix";
+    CORIOLIS_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::coriolis";
+    ROBOT_GRAVITY_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::robot_gravity";
+    SAFETY_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::safety_torques";
+    SENT_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::sent_torques";
+    CONSTRAINED_NULLSPACE_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::constraint_nullspace";
 
     // start redis client
     CDatabaseRedisClient* redis_client;
@@ -211,9 +278,9 @@ int main (int argc, char** argv) {
     _filter_out.setDimension(7);
     _filter_out.setCutoffFrequency(0.01);  // velocity sensor output (not typically used)
 
-    if (USING_PANDA) {
-        std::cout << "Using Franka Panda specifications\n";
-        // Panda specifications 
+    if (USING_4S) {
+        std::cout << "Using Rizon 4s specifications\n";
+        // Rizon 4S specifications 
         joint_position_max_default = {2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973};
         joint_position_min_default = {-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
         joint_velocity_limits_default = {2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100};
@@ -227,22 +294,23 @@ int main (int argc, char** argv) {
         pos_zones = {6., 9.};  // hard, soft
         // vel_zones = {5., 7.};  // hard, soft
         vel_zones = {6., 8.};  // hard, soft  (8, 6)
-    } else {
-        std::cout << "Using FR3 specifications\n";
-        // FR3 specifications
-        joint_position_max_default = {2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
-        joint_position_min_default = {-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
-        // joint_velocity_limits_default = {2, 1, 1.5, 1.25, 3, 1.5, 3};  // FR3 conservative rectangle bounds 
-        joint_velocity_limits_default = {3, 3, 3, 3, 3, 3, 3};  // FR3 conservative rectangle bounds 
-        joint_torques_limits_default = {87, 87, 87, 87, 12, 12, 12};
+    } 
+    // else {
+    //     std::cout << "Using FR3 specifications\n";
+    //     // FR3 specifications
+    //     joint_position_max_default = {2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
+    //     joint_position_min_default = {-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
+    //     // joint_velocity_limits_default = {2, 1, 1.5, 1.25, 3, 1.5, 3};  // FR3 conservative rectangle bounds 
+    //     joint_velocity_limits_default = {3, 3, 3, 3, 3, 3, 3};  // FR3 conservative rectangle bounds 
+    //     joint_torques_limits_default = {87, 87, 87, 87, 12, 12, 12};
 
-        // damping gains 
-        kv_safety = {15.0, 15.0, 15.0, 10.0, 5.0, 5.0, 5.0};
+    //     // damping gains 
+    //     kv_safety = {15.0, 15.0, 15.0, 10.0, 5.0, 5.0, 5.0};
 
-        // zone definitions
-        pos_zones = {6., 9.};  
-        vel_zones = {6., 8.};
-    }
+    //     // zone definitions
+    //     pos_zones = {6., 9.};  
+    //     vel_zones = {6., 8.};
+    // }
 
     // limit options
     bool _pos_limit_opt = true;
@@ -312,7 +380,7 @@ int main (int argc, char** argv) {
     // std::thread redis_thread(redis_transfer, redis_client);
 
     // connect to robot and gripper
-    franka::Robot robot(robot_ip);
+    franka::Robot robot(robot_sn);
     // load the kinematics and dynamics model
     franka::Model model = robot.loadModel();
 

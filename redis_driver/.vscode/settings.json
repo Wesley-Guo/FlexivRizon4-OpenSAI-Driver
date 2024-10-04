@@ -57,5 +57,8 @@
         "thread": "cpp",
         "cinttypes": "cpp",
         "typeinfo": "cpp"
+    }, 
+    "cmake.configureSettings": {
+        "CMAKE_INSTALL_PREFIX":"~/rdk_install"
     }
 }

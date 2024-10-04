@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 3.0 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.16.3)
 
-project(franka_panda_redis_driver)
+project(flexiv_rizon4_redis_driver)
 
 # CMAKE OPTIONS
 # set(CMAKE_BUILD_TYPE Debug)
@@ -16,14 +16,13 @@ set(SOURCES
 
 # Create a library
 add_executable(${PROJECT_NAME} ${SOURCES})
-add_executable(gripper_driver gripper.cpp)
 
-# LIBFRANKA
-find_package(Franka REQUIRED PATHS ${PROJECT_SOURCE_DIR}/../libfranka/build)
-set(Franka_INCLUDE_DIR ${Franka_DIR}/../include)
+# Find flexiv_rdk INTERFACE library
+find_package(flexiv_rdk REQUIRED)
 
 # - hiredis
 find_library(HIREDIS_LIBRARY hiredis)
+
 
 # - jsoncpp
 if (CMAKE_SYSTEM_NAME MATCHES Darwin) 
@@ -40,22 +39,19 @@ endif ()
 find_package(Eigen3 REQUIRED)
 
 # create headers list
-set(franka_panda_redis_driver_INCLUDE_DIRS 
-    ${Franka_INCLUDE_DIR}
+set(flexiv_rizon4_redis_driver_INCLUDE_DIRS 
     ${EIGEN3_INCLUDE_DIR}
     ${JSONCPP_INCLUDE_DIRS}
 )
 
 # create libraries list
-set(franka_panda_redis_driver_LIBRARIES 
-    ${Franka_LIBRARIES}   
+set(flexiv_rizon4_redis_driver_LIBRARIES 
+    flexiv::flexiv_rdk
     ${HIREDIS_LIBRARY}
     ${JSONCPP_LIBRARY}
     -lrt
     -lpthread
 )
 
-include_directories( ${franka_panda_redis_driver_INCLUDE_DIRS} )
-target_link_libraries(${PROJECT_NAME} ${franka_panda_redis_driver_LIBRARIES})
-target_link_libraries(gripper_driver ${franka_panda_redis_driver_LIBRARIES})
-
+include_directories( ${flexiv_rizon4_redis_driver_INCLUDE_DIRS} )
+target_link_libraries(${PROJECT_NAME} ${flexiv_rizon4_redis_driver_LIBRARIES})
