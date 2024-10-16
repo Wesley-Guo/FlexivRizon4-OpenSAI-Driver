@@ -15,6 +15,7 @@
 #include "ButterworthFilter.h"
 
 #include <flexiv/robot.h>
+#include <flexiv/model.h>
 #include <flexiv/log.h>
 #include <flexiv/scheduler.h>
 #include <flexiv/utility.h>
@@ -70,32 +71,6 @@ bool safety_mode_flag = false;
 bool safety_enabled = false;  
 int safety_controller_count = 200;
 
-// data 
-Eigen::MatrixXd MassMatrix;
-std::array<double, 7> tau_cmd_array{};
-std::array<double, 7> q_array{};
-std::array<double, 7> dq_array{};
-std::array<double, 7> tau_sensed_array{};
-std::array<double, 7> gravity_vector{};
-std::array<double, 7> coriolis{};
-std::array<double, 49> M_array{};  
-std::vector<std::array<double, 7>> sensor_feedback;
-std::vector<string> key_names;
-// bool fDriverRunning = true;
-// void sighandler(int sig)
-// { fDriverRunning = false; }
-
-unsigned long long counter = 0;
-
-// void redis_transfer(CDatabaseRedisClient* redis_client)
-// {
-//   while(fDriverRunning)
-//   {
-//     Eigen::Map<const Eigen::Matrix<double, 7, 7> > MassMatrix(M_array.data());
-//     redis_client->setGetBatchCommands(key_names, tau_cmd_array, MassMatrix, sensor_feedback);
-//   }
-// }
-
 enum Limit {
     SAFE = 0,
     MIN_SOFT,  // soft lower position limit
@@ -108,11 +83,83 @@ enum Limit {
     MAX_HARD_VEL
 };
 
+// data 
+Eigen::MatrixXd MassMatrix;
+std::array<double, 7> tau_cmd_array{};
+std::array<double, 7> q_array{};
+std::array<double, 7> dq_array{};
+std::array<double, 7> tau_sensed_array{};
+// std::array<double, 7> gravity_vector{};
+// std::array<double, 7> coriolis{};
+// std::array<double, 49> M_array{};  
+Eigen::VectorXd gravity_vector{};
+Eigen::VectorXd coriolis{};
+Eigen::MatrixXd M_array{};  
+std::vector<std::array<double, 7>> sensor_feedback;
+std::vector<string> key_names;
+// bool fDriverRunning = true;
+// void sighandler(int sig)
+// { fDriverRunning = false; }
+
+ // create low pass filters for velocities (if needed; currently not used)
+Eigen::VectorXd _vel_raw = Eigen::VectorXd::Zero(7);
+Eigen::VectorXd _vel_filtered = Eigen::VectorXd::Zero(7);
+Eigen::VectorXd _vel_out_filtered = Eigen::VectorXd::Zero(7);
+
+// limit options
+bool _pos_limit_opt = true;
+bool _vel_limit_opt = true;
+
+// setup joint limit avoidance 
+std::vector<int> _pos_limit_flag {7, SAFE};
+std::vector<int> _vel_limit_flag {7, SAFE};
+Eigen::MatrixXd _J_s;  // constraint task jacobian for nullspace projection (n_limited x dof)   
+Eigen::MatrixXd _Lambda_s;  // op-space matrix
+Eigen::MatrixXd _Jbar_s;
+Eigen::MatrixXd _N_s = Eigen::MatrixXd::Identity(7, 7);  // nullspace matrix with the constraint task jacobian 
+Eigen::VectorXi _limited_joints(7);  // 1 or 0 depending on whether the joint is limited  
+Eigen::VectorXd _tau_limited = Eigen::VectorXd::Zero(7);
+Eigen::VectorXd _torque_scaling_vector = Eigen::VectorXd::Ones(7);  // tau scaling based on the velocity signal 
+
+// override with new safety set (this set triggers software stop)
+double default_sf = 0.98;  // max violation safety factors
+
+// zone 1 and 2 definitions subject to tuning
+double soft_sf = 0.90;  // start of damping zone 
+double hard_sf = 0.95;  // start of feedback zone 
+double angle_tol = 1 * M_PI / 180;  // rad 
+double vel_tol = 0.1;  // rad/s (0.1 = 5 deg/s)
+double q_tol = 1e-1 * M_PI / 180;  
+
+Eigen::VectorXd soft_min_angles(7);
+Eigen::VectorXd soft_max_angles(7);
+Eigen::VectorXd hard_min_angles(7);
+Eigen::VectorXd hard_max_angles(7);
+Eigen::VectorXd soft_min_joint_velocity_limits(7);
+Eigen::VectorXd hard_min_joint_velocity_limits(7);
+Eigen::VectorXd soft_max_joint_velocity_limits(7);
+Eigen::VectorXd hard_max_joint_velocity_limits(7);
+
+// timing 
+std::clock_t start;
+double duration;
+
+unsigned long long counter = 0;
+
+// void redis_transfer(CDatabaseRedisClient* redis_client)
+// {
+//   while(fDriverRunning)
+//   {
+//     Eigen::Map<const Eigen::Matrix<double, 7, 7> > MassMatrix(M_array.data());
+//     redis_client->setGetBatchCommands(key_names, tau_cmd_array, MassMatrix, sensor_feedback);
+//   }
+// }
+
 const std::vector<string> limit_state {"Safe", "Soft Min", "Hard Min", "Soft Max", "Hard Max", "Min Soft Vel", "Min Hard Vel", "Max Soft Vel", "Max Hard Vel"};
 
 /** Joint velocity damping gains for floating */
 const std::array<double, flexiv::kJointDOF> kFloatingDamping
-    = {10.0, 10.0, 5.0, 5.0, 1.0, 1.0, 1.0};
+    = {30.0, 30.0, 15.0, 15.0, 3.0, 3.0, 3.0};
 
 /** Atomic signal to stop scheduler tasks */
 std::atomic<bool> g_stop_sched = {false};
@@ -153,246 +200,59 @@ void PrintHelp()
     std::cout << "Required arguments: [robot SN]" << std::endl;
     std::cout << "    robot SN: Serial number of the robot to connect to. "
                  "Remove any space, for example: Rizon4s-123456" << std::endl;
-    std::cout << "Optional arguments: [--hold]" << std::endl;
-    std::cout << "    --hold: robot holds current joint positions, otherwise do a sine-sweep" << std::endl;
+    // std::cout << "Optional arguments: [--hold]" << std::endl;
+    // std::cout << "    --hold: robot holds current joint positions, otherwise do a sine-sweep" << std::endl;
     std::cout << std::endl;
     // clang-format on
 }
 
 /** @brief Callback function for realtime periodic task */
-void PeriodicTask(flexiv::Robot& robot, flexiv::Log& log)
+void PeriodicTask(flexiv::Robot& robot, flexiv::Model& model, flexiv::Log& log, CDatabaseRedisClient* redis_client)
 {
+    
     try {
+        
+        sai::ButterworthFilter _filter;
+        _filter.setDimension(7);
+        _filter.setCutoffFrequency(0.005);  // very smooth velocity signal to increase kv damping 
+        sai::ButterworthFilter _filter_out;
+        _filter_out.setDimension(7);
+        _filter_out.setCutoffFrequency(0.01);  // velocity sensor output (not typically used)
+
+        for (int i = 0; i < 7; ++i) {
+            joint_position_max[i] = default_sf * joint_position_max_default[i];
+            joint_position_min[i] = default_sf * joint_position_min_default[i];
+            joint_velocity_limits[i] = default_sf * joint_velocity_limits_default[i];
+            joint_torques_limits[i] = default_sf * joint_torques_limits_default[i];
+        }
+
+        for (int i = 0; i < 7; ++i) {
+            soft_min_angles(i) = joint_position_min[i] + pos_zones[1] * angle_tol;
+            hard_min_angles(i) = joint_position_min[i] + pos_zones[0] * angle_tol;
+            soft_max_angles(i) = joint_position_max[i] - pos_zones[1] * angle_tol;
+            hard_max_angles(i) = joint_position_max[i] - pos_zones[0] * angle_tol;
+            soft_min_joint_velocity_limits(i) = - joint_velocity_limits[i] + vel_zones[1] * vel_tol;
+            hard_min_joint_velocity_limits(i) = - joint_velocity_limits[i] + vel_zones[0] * vel_tol;
+            soft_max_joint_velocity_limits(i) = joint_velocity_limits[i] - vel_zones[1] * vel_tol;
+            hard_max_joint_velocity_limits(i) = joint_velocity_limits[i] - vel_zones[0] * vel_tol;
+
+            // // specific joint offsets 
+            // if (i == 6) {
+            //     soft_min_joint_velocity_limits(i) += 4.5 * vel_tol;
+            //     hard_min_joint_velocity_limits(i) += 4.5 * vel_tol;
+            //     soft_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
+            //     hard_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
+            // }
+        }   
+        
         // Monitor fault on the connected robot
         if (robot.fault()) {
             throw std::runtime_error(
                 "PeriodicTask: Fault occurred on the connected robot, exiting ...");
         }
-
-        // Set 0 joint torques
-        std::array<double, flexiv::kJointDOF> target_torque = {};
-
-        // Add some velocity damping
-        for (size_t i = 0; i < flexiv::kJointDOF; ++i) {
-            target_torque[i] += -kFloatingDamping[i] * robot.states().dtheta[i];
-        }
-
-        // Send target joint torque to RDK server, enable gravity compensation and joint limits soft
-        // protection
-        robot.StreamJointTorque(target_torque, true, true);
-
-    } catch (const std::exception& e) {
-        log.Error(e.what());
-        g_stop_sched = true;
-    }
-}
-
-
-int main (int argc, char** argv) {
-
-    // Program Setup
-    // =============================================================================================
-    // Logger for printing message with timestamp and coloring
-    flexiv::Log log;
-
-    // Parse parameters
-    if (argc < 2 || flexiv::utility::ProgramArgsExistAny(argc, argv, {"-h", "--help"})) {
-        PrintHelp();
-        return 1;
-    }
-    // Serial number of the robot to connect to. Remove any space, for example: Rizon4s-123456
-    std::string robot_sn = argv[1];
-
-    std::map<string, string> robot_id;
-    robot_id[""] = "";
-    // robot_id["172.16.0.10"] = "Romeo";
-    // robot_id["172.16.0.11"] = "Juliet";
-    robot_id["test"] = "4S-Oberon";
-    // robot_id["172.16.0.11"] = "Juliet";
-
-    JOINT_TORQUES_COMMANDED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::actuators::fgc";
-    JOINT_ANGLES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::q";
-    JOINT_VELOCITIES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::dq";
-    JOINT_TORQUES_SENSED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::torques";
-    MASSMATRIX_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::massmatrix";
-    CORIOLIS_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::coriolis";
-    ROBOT_GRAVITY_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::robot_gravity";
-    SAFETY_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::safety_torques";
-    SENT_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::sent_torques";
-    CONSTRAINED_NULLSPACE_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::constraint_nullspace";
-
-    // start redis client
-    CDatabaseRedisClient* redis_client;
-    HiredisServerInfo info;
-    info.hostname_ = "127.0.0.1";
-    info.port_ = 6379;
-    info.timeout_ = { 1, 500000 }; // 1.5 seconds
-    redis_client = new CDatabaseRedisClient();
-    redis_client->serverIs(info);
-
-    // // set up signal handler
-    // signal(SIGABRT, &sighandler);
-    // signal(SIGTERM, &sighandler);
-    // signal(SIGINT, &sighandler);
-
-    // debug_function(redis_client);
-
-    for (int i = 0; i < 7; ++i) {
-        tau_cmd_array[i] = 0;
-    }
-
-    redis_client->setDoubleArray(JOINT_TORQUES_COMMANDED_KEY, tau_cmd_array, 7);
-    // safety to detect if controller is already running : wait 50 milliseconds
-    usleep(50000);
-    redis_client->getDoubleArray(JOINT_TORQUES_COMMANDED_KEY, tau_cmd_array, 7);
-    for(int i = 0; i < 7; ++i) {
-        if (tau_cmd_array[i] != 0) {
-            std::cout << "Stop the controller before running the driver\n" << "\n";
-            return -1;
-        }
-    }
-
-    // prepare batch command
-    key_names.push_back(JOINT_TORQUES_COMMANDED_KEY);
-    key_names.push_back(MASSMATRIX_KEY);
-    key_names.push_back(JOINT_ANGLES_KEY);
-    key_names.push_back(JOINT_VELOCITIES_KEY);
-    key_names.push_back(JOINT_TORQUES_SENSED_KEY);
-    key_names.push_back(ROBOT_GRAVITY_KEY);
-    key_names.push_back(CORIOLIS_KEY);
-
-    sensor_feedback.push_back(q_array);
-    sensor_feedback.push_back(dq_array);
-    sensor_feedback.push_back(tau_sensed_array);
-    sensor_feedback.push_back(gravity_vector);
-    sensor_feedback.push_back(coriolis);
-
-    // create low pass filters for velocities (if needed; currently not used)
-    Eigen::VectorXd _vel_raw = Eigen::VectorXd::Zero(7);
-    Eigen::VectorXd _vel_filtered = Eigen::VectorXd::Zero(7);
-    Eigen::VectorXd _vel_out_filtered = Eigen::VectorXd::Zero(7);
-    sai::ButterworthFilter _filter;
-    _filter.setDimension(7);
-    _filter.setCutoffFrequency(0.005);  // very smooth velocity signal to increase kv damping 
-    sai::ButterworthFilter _filter_out;
-    _filter_out.setDimension(7);
-    _filter_out.setCutoffFrequency(0.01);  // velocity sensor output (not typically used)
-
-    if (USING_4S) {
-        std::cout << "Using Rizon 4s specifications\n";
-        // Rizon 4S specifications 
-        joint_position_max_default = {2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973};
-        joint_position_min_default = {-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
-        joint_velocity_limits_default = {2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100};
-        joint_torques_limits_default = {87, 87, 87, 87, 12, 12, 12};
-
-        // damping gains 
-        // kv_safety = {20.0, 20.0, 20.0, 15.0, 10.0, 10.0, 5.0};
-        kv_safety = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 5.0};
-
-        // zone definitions
-        pos_zones = {6., 9.};  // hard, soft
-        // vel_zones = {5., 7.};  // hard, soft
-        vel_zones = {6., 8.};  // hard, soft  (8, 6)
-    } 
-    // else {
-    //     std::cout << "Using FR3 specifications\n";
-    //     // FR3 specifications
-    //     joint_position_max_default = {2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
-    //     joint_position_min_default = {-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
-    //     // joint_velocity_limits_default = {2, 1, 1.5, 1.25, 3, 1.5, 3};  // FR3 conservative rectangle bounds 
-    //     joint_velocity_limits_default = {3, 3, 3, 3, 3, 3, 3};  // FR3 conservative rectangle bounds 
-    //     joint_torques_limits_default = {87, 87, 87, 87, 12, 12, 12};
-
-    //     // damping gains 
-    //     kv_safety = {15.0, 15.0, 15.0, 10.0, 5.0, 5.0, 5.0};
-
-    //     // zone definitions
-    //     pos_zones = {6., 9.};  
-    //     vel_zones = {6., 8.};
-    // }
-
-    // limit options
-    bool _pos_limit_opt = true;
-    bool _vel_limit_opt = true;
-
-    // setup joint limit avoidance 
-    std::vector<int> _pos_limit_flag {7, SAFE};
-    std::vector<int> _vel_limit_flag {7, SAFE};
-    Eigen::MatrixXd _J_s;  // constraint task jacobian for nullspace projection (n_limited x dof)   
-    Eigen::MatrixXd _Lambda_s;  // op-space matrix
-    Eigen::MatrixXd _Jbar_s;
-    Eigen::MatrixXd _N_s = Eigen::MatrixXd::Identity(7, 7);  // nullspace matrix with the constraint task jacobian 
-    Eigen::VectorXi _limited_joints(7);  // 1 or 0 depending on whether the joint is limited  
-    Eigen::VectorXd _tau_limited = Eigen::VectorXd::Zero(7);
-    Eigen::VectorXd _torque_scaling_vector = Eigen::VectorXd::Ones(7);  // tau scaling based on the velocity signal 
-
-    // override with new safety set (this set triggers software stop)
-    double default_sf = 0.98;  // max violation safety factor 
-    for (int i = 0; i < 7; ++i) {
-        joint_position_max[i] = default_sf * joint_position_max_default[i];
-        joint_position_min[i] = default_sf * joint_position_min_default[i];
-        joint_velocity_limits[i] = default_sf * joint_velocity_limits_default[i];
-        joint_torques_limits[i] = default_sf * joint_torques_limits_default[i];
-    }
-
-    // zone 1 and 2 definitions subject to tuning
-    double soft_sf = 0.90;  // start of damping zone 
-    double hard_sf = 0.95;  // start of feedback zone 
-    double angle_tol = 1 * M_PI / 180;  // rad 
-    double vel_tol = 0.1;  // rad/s (0.1 = 5 deg/s)
-    double q_tol = 1e-1 * M_PI / 180;  
-
-    Eigen::VectorXd soft_min_angles(7);
-    Eigen::VectorXd soft_max_angles(7);
-    Eigen::VectorXd hard_min_angles(7);
-    Eigen::VectorXd hard_max_angles(7);
-    Eigen::VectorXd soft_min_joint_velocity_limits(7);
-    Eigen::VectorXd hard_min_joint_velocity_limits(7);
-    Eigen::VectorXd soft_max_joint_velocity_limits(7);
-    Eigen::VectorXd hard_max_joint_velocity_limits(7);
-
-    for (int i = 0; i < 7; ++i) {
-        soft_min_angles(i) = joint_position_min[i] + pos_zones[1] * angle_tol;
-        hard_min_angles(i) = joint_position_min[i] + pos_zones[0] * angle_tol;
-        soft_max_angles(i) = joint_position_max[i] - pos_zones[1] * angle_tol;
-        hard_max_angles(i) = joint_position_max[i] - pos_zones[0] * angle_tol;
-        soft_min_joint_velocity_limits(i) = - joint_velocity_limits[i] + vel_zones[1] * vel_tol;
-        hard_min_joint_velocity_limits(i) = - joint_velocity_limits[i] + vel_zones[0] * vel_tol;
-        soft_max_joint_velocity_limits(i) = joint_velocity_limits[i] - vel_zones[1] * vel_tol;
-        hard_max_joint_velocity_limits(i) = joint_velocity_limits[i] - vel_zones[0] * vel_tol;
-
-        // // specific joint offsets 
-        // if (i == 6) {
-        //     soft_min_joint_velocity_limits(i) += 4.5 * vel_tol;
-        //     hard_min_joint_velocity_limits(i) += 4.5 * vel_tol;
-        //     soft_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
-        //     hard_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
-        // }
-    }
-
-    // timing 
-    std::clock_t start;
-    double duration;
-
-    try {
-    // start the redis thread first
-    // std::thread redis_thread(redis_transfer, redis_client);
-
-    // connect to robot and gripper
-    franka::Robot robot(robot_sn);
-    // load the kinematics and dynamics model
-    franka::Model model = robot.loadModel();
-
-    // set collision behavior
-    robot.setCollisionBehavior({{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
-                                {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
-                                {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
-                                {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}});
-
-    auto torque_control_callback = [&](const franka::RobotState& robot_state,
-                                        franka::Duration period) -> franka::Torques 
-    {
+        
+        auto robot_state = robot.states();
+        
         // filter velocities 
         for (int i = 0; i < 7; ++i) {
             _vel_raw(i) = robot_state.dq[i];
@@ -403,42 +263,46 @@ int main (int argc, char** argv) {
             dq_array[i] = _vel_out_filtered[i];
         }
 
+        model.Update(robot_state.q, robot_state.dq);
+
         // start = std::clock();
         sensor_feedback[0] = robot_state.q;
         sensor_feedback[1] = robot_state.dq;  // non-filtered velocities 
         // sensor_feedback[1] = dq_array;  // filtered velocities
-        sensor_feedback[2] = robot_state.tau_J;
-        sensor_feedback[3] = model.gravity(robot_state);
-        sensor_feedback[4] = model.coriolis(robot_state);
+        sensor_feedback[2] = robot_state.tau;
+        // Flexiv returns gravity and coriolis as Eigen::VectorXd objects, map back to std::vector
+        gravity_vector = model.g();
+        coriolis  = model.c();
 
         // compute joint velocity limits at configuration if using FR3 and not using conservative bounds 
-        if (!USING_PANDA && !USING_CONSERVATIVE_FR3) {
-            joint_velocity_lower_limits = getMinJointVelocity(sensor_feedback[0]);
-            joint_velocity_upper_limits = getMaxJointVelocity(sensor_feedback[0]);
-            for (int i = 0; i < 7; ++i) {
-                soft_min_joint_velocity_limits(i) = joint_velocity_lower_limits[i] + pos_zones[1] * vel_tol;
-                hard_min_joint_velocity_limits(i) = joint_velocity_lower_limits[i] + pos_zones[0] * vel_tol;
-                soft_max_joint_velocity_limits(i) = joint_velocity_upper_limits[i] - pos_zones[1] * vel_tol;
-                hard_max_joint_velocity_limits(i) = joint_velocity_upper_limits[i] - pos_zones[0] * vel_tol;
+        // if (!USING_PANDA && !USING_CONSERVATIVE_FR3) {
+        //     joint_velocity_lower_limits = getMinJointVelocity(sensor_feedback[0]);
+        //     joint_velocity_upper_limits = getMaxJointVelocity(sensor_feedback[0]);
+        //     for (int i = 0; i < 7; ++i) {
+        //         soft_min_joint_velocity_limits(i) = joint_velocity_lower_limits[i] + pos_zones[1] * vel_tol;
+        //         hard_min_joint_velocity_limits(i) = joint_velocity_lower_limits[i] + pos_zones[0] * vel_tol;
+        //         soft_max_joint_velocity_limits(i) = joint_velocity_upper_limits[i] - pos_zones[1] * vel_tol;
+        //         hard_max_joint_velocity_limits(i) = joint_velocity_upper_limits[i] - pos_zones[0] * vel_tol;
                 
-                // // specific value for last joint
-                // if (i == 6) {
-                //     soft_min_joint_velocity_limits(i) += 4.5 * vel_tol;
-                //     hard_min_joint_velocity_limits(i) += 4.5 * vel_tol;
-                //     soft_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
-                //     hard_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
-                // }
-            }
-        }
+        //         // // specific value for last joint
+        //         // if (i == 6) {
+        //         //     soft_min_joint_velocity_limits(i) += 4.5 * vel_tol;
+        //         //     hard_min_joint_velocity_limits(i) += 4.5 * vel_tol;
+        //         //     soft_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
+        //         //     hard_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
+        //         // }
+        //     }
+        // }
 
-        M_array = model.mass(robot_state);
-        Eigen::Map<const Eigen::Matrix<double, 7, 7>> MassMatrix(M_array.data());
+        MassMatrix = model.M();
         Eigen::Map<Eigen::Matrix<double, 7, 1>> _tau(tau_cmd_array.data());
         Eigen::Map<Eigen::Matrix<double, 7, 1>> _sensed_torques(sensor_feedback[2].data());  // sensed torques 
         Eigen::Map<Eigen::Matrix<double, 7, 1>> _coriolis(sensor_feedback[4].data());
         Eigen::MatrixXd MassMatrixInverse = MassMatrix.llt().solve(Eigen::MatrixXd::Identity(7, 7));
 
         redis_client->setGetBatchCommands(key_names, tau_cmd_array, MassMatrix, sensor_feedback);
+        redis_client->setEigenMatrixDerived(ROBOT_GRAVITY_KEY, gravity_vector);
+        redis_client->setEigenMatrixDerived(CORIOLIS_KEY, coriolis);
 
         // reset containers
         _limited_joints.setZero();  // used to form the constraint jacobian 
@@ -450,17 +314,22 @@ int main (int argc, char** argv) {
                 double curr_q = robot_state.q[i];
                 if (curr_q > soft_min_angles(i) && curr_q < soft_max_angles(i)) {
                     _pos_limit_flag[i] = SAFE;
+                    // std::cout << "joint" << i << " SAFE" << "\n";
                 } else if (curr_q < hard_min_angles(i)) {
                     _pos_limit_flag[i] = MIN_HARD;
+                    std::cout << "joint" << i << "MIN_HARD" << "\n";
                     _limited_joints(i) = 1;
                 } else if (curr_q < soft_min_angles(i)) {
                     _pos_limit_flag[i] = MIN_SOFT;
+                    std::cout << "joint" << i << "MIN_SOFT" << "\n";
                     _limited_joints(i) = 1;
                 } else if (curr_q > hard_max_angles(i)) {
                     _pos_limit_flag[i] = MAX_HARD;
+                    std::cout << "joint" << i << "MAX_HARD" << "\n";
                     _limited_joints(i) = 1;
                 } else if (curr_q > soft_max_angles(i)) {
-                    _pos_limit_flag[i] = MAX_SOFT;   
+                    _pos_limit_flag[i] = MAX_SOFT;
+                    std::cout << "joint" << i << "MAX_SOFT" << "\n";   
                     _limited_joints(i) = 1;       
                 }
             }
@@ -645,31 +514,31 @@ int main (int argc, char** argv) {
             // }
         }
 
-        if (safety_enabled) {
-            // cartesian checks
-            Eigen::Affine3d T_EE(Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
-            Eigen::Vector3d pos_monitoring_point = T_EE*monitoring_point_ee_frame;
-            double radius_square = pos_monitoring_point(0)*pos_monitoring_point(0) + pos_monitoring_point(1)*pos_monitoring_point(1);
-            double z_ee = pos_monitoring_point(2);
+        // if (safety_enabled) {
+        //     // cartesian checks
+        //     Eigen::Affine3d T_EE(Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
+        //     Eigen::Vector3d pos_monitoring_point = T_EE*monitoring_point_ee_frame;
+        //     double radius_square = pos_monitoring_point(0)*pos_monitoring_point(0) + pos_monitoring_point(1)*pos_monitoring_point(1);
+        //     double z_ee = pos_monitoring_point(2);
 
-            // lower plane
-            if (z_ee < safety_plane_z_coordinate) {
-                safety_mode_flag = true;
-                if (safety_controller_count == 200) {
-                    std::cout << "WARNING : End effector too low, engaging safety mode" << std::endl;
-                    std::cout << "position of monitoring point : " << pos_monitoring_point.transpose() << std::endl;
-                }       
-            }
-            // cylinder
-            if (z_ee < safety_cylinder_height && radius_square < safety_cylinder_radius*safety_cylinder_radius) {
-                safety_mode_flag = true;
-                if (safety_controller_count == 200) {
-                    std::cout << "WARNING : End effector too close to center of workspace, engaging safety mode" << std::endl;
-                    std::cout << "position of monitoring point : " << pos_monitoring_point.transpose() << std::endl;
-                }       
-            }
-            // std::cout << pos_monitoring_point.transpose() << std::endl;
-        }
+        //     // lower plane
+        //     if (z_ee < safety_plane_z_coordinate) {
+        //         safety_mode_flag = true;
+        //         if (safety_controller_count == 200) {
+        //             std::cout << "WARNING : End effector too low, engaging safety mode" << std::endl;
+        //             std::cout << "position of monitoring point : " << pos_monitoring_point.transpose() << std::endl;
+        //         }       
+        //     }
+        //     // cylinder
+        //     if (z_ee < safety_cylinder_height && radius_square < safety_cylinder_radius*safety_cylinder_radius) {
+        //         safety_mode_flag = true;
+        //         if (safety_controller_count == 200) {
+        //             std::cout << "WARNING : End effector too close to center of workspace, engaging safety mode" << std::endl;
+        //             std::cout << "position of monitoring point : " << pos_monitoring_point.transpose() << std::endl;
+        //         }       
+        //     }
+        //     // std::cout << pos_monitoring_point.transpose() << std::endl;
+        // }
 
         // safety mode
         if (safety_mode_flag) {
@@ -683,26 +552,226 @@ int main (int argc, char** argv) {
             safety_controller_count--;
         }
 
+        // Monitor fault on the connected robot
+        if (robot.fault()) {
+            throw std::runtime_error(
+                "PeriodicTask: Fault occurred on the connected robot, exiting ...");
+        }
+
+        // std::cout << "Before Setting Target Torques\n" << "\n";
+
+        // Set joint torques to command torques from Redis
+        std::array<double, flexiv::kJointDOF> target_torque = tau_cmd_array;
+
+        // Set 0 joint toruqes
+        // std::array<double, flexiv::kJointDOF> target_torque = {};
+
+        // Add some velocity damping
+        for (size_t i = 0; i < flexiv::kJointDOF; ++i) {
+            target_torque[i] += -kFloatingDamping[i] * robot.states().dtheta[i];
+            // std::cout << target_torque[i] << "\n";
+        }
+
+        // std::cout << "After Setting Target Torques\n" << "\n";
+
+        // Send target joint torque to RDK server, enable gravity compensation and joint limits soft
+        // protection
+        robot.StreamJointTorque(target_torque, true, true);
+
+        // std::cout << "After Sending Target Torques\n" << "\n";
+
         counter++;
-        return tau_cmd_array;
-    };
 
-    // start real-time control loop
-    robot.control(torque_control_callback);
-    // robot.control(torque_control_callback, false, franka::kMaxCutoffFrequency);
-    // stop redis
-    // fDriverRunning = false;
-    // redis_thread.join();
+    } catch (const std::exception& e) {
+        std::cout << "Error \n" << "\n";
+        log.Error(e.what());
+        g_stop_sched = true;
+    }
+}
 
-    } catch (const std::exception& ex) {
-    // print exception
-    std::cout << ex.what() << std::endl;
-    std::cout << "counter : " << counter << std::endl;
-    // stop redis
-    // fDriverRunning = false;
-    // redis_thread.join();
+int main (int argc, char** argv) {
+
+    // Program Setup
+    // =============================================================================================
+    // Logger for printing message with timestamp and coloring
+    flexiv::Log log;
+
+    // Parse parameters
+    if (argc < 2 || flexiv::utility::ProgramArgsExistAny(argc, argv, {"-h", "--help"})) {
+        PrintHelp();
+        return 1;
+    }
+    // Serial number of the robot to connect to. Remove any space, for example: Rizon4s-123456
+    std::string robot_sn = argv[1];
+
+    std::map<string, string> robot_id;
+    robot_id[""] = "";
+    // robot_id["172.16.0.10"] = "Romeo";
+    // robot_id["172.16.0.11"] = "Juliet";
+    robot_id["Rizon4s_062232"] = "4S-Oberon";
+    // robot_id["172.16.0.11"] = "Juliet";
+
+    JOINT_TORQUES_COMMANDED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::actuators::fgc";
+    JOINT_ANGLES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::q";
+    JOINT_VELOCITIES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::dq";
+    JOINT_TORQUES_SENSED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::torques";
+    MASSMATRIX_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::massmatrix";
+    CORIOLIS_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::coriolis";
+    ROBOT_GRAVITY_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::robot_gravity";
+    SAFETY_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::safety_torques";
+    SENT_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::sent_torques";
+    CONSTRAINED_NULLSPACE_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::constraint_nullspace";
+
+    // start redis client
+    CDatabaseRedisClient* redis_client;
+    HiredisServerInfo info;
+    info.hostname_ = "127.0.0.1";
+    info.port_ = 6379;
+    info.timeout_ = { 1, 500000 }; // 1.5 seconds
+    redis_client = new CDatabaseRedisClient();
+    redis_client->serverIs(info);
+
+    // // set up signal handler
+    // signal(SIGABRT, &sighandler);
+    // signal(SIGTERM, &sighandler);
+    // signal(SIGINT, &sighandler);
+
+    // debug_function(redis_client);
+
+    for (int i = 0; i < 7; ++i) {
+        tau_cmd_array[i] = 0;
     }
 
+    redis_client->setDoubleArray(JOINT_TORQUES_COMMANDED_KEY, tau_cmd_array, 7);
+    // safety to detect if controller is already running : wait 50 milliseconds
+    usleep(50000);
+    redis_client->getDoubleArray(JOINT_TORQUES_COMMANDED_KEY, tau_cmd_array, 7);
+    for(int i = 0; i < 7; ++i) {
+        if (tau_cmd_array[i] != 0) {
+            std::cout << "Stop the controller before running the driver\n" << "\n";
+            return -1;
+        }
+    }
+
+    // prepare batch command
+    key_names.push_back(JOINT_TORQUES_COMMANDED_KEY);
+    key_names.push_back(MASSMATRIX_KEY);
+    key_names.push_back(JOINT_ANGLES_KEY);
+    key_names.push_back(JOINT_VELOCITIES_KEY);
+    key_names.push_back(JOINT_TORQUES_SENSED_KEY);
+    // key_names.push_back(ROBOT_GRAVITY_KEY);
+    // key_names.push_back(CORIOLIS_KEY);
+
+    sensor_feedback.push_back(q_array);
+    sensor_feedback.push_back(dq_array);
+    sensor_feedback.push_back(tau_sensed_array);
+    // sensor_feedback.push_back(gravity_vector);
+    // sensor_feedback.push_back(coriolis);
+
+    if (USING_4S) {
+        std::cout << "Using Rizon 4s specifications\n";
+        // Rizon 4S specifications 
+        joint_position_max_default = {2.7925, 2.2689, 2.9670, 2.6878, 2.9670, 4.5378, 2.9670};
+        joint_position_min_default = {-2.7925, -2.2689, -2.9670, -1.8675, -2.9670, -1.3962, -2.9670};
+        joint_velocity_limits_default = {2.0994, 2.0944, 2.4435, 2.4435, 4.8869, 4.8869, 4.8869};
+        joint_torques_limits_default = {123, 123, 64, 64, 39, 39, 39};
+
+        // damping gains 
+        // kv_safety = {20.0, 20.0, 20.0, 15.0, 10.0, 10.0, 5.0};
+        kv_safety = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 5.0};
+
+        // zone definitions
+        pos_zones = {6., 9.};  // hard, soft
+        // vel_zones = {5., 7.};  // hard, soft
+        vel_zones = {6., 8.};  // hard, soft  (8, 6)
+    } 
+    // else {
+    //     std::cout << "Using FR3 specifications\n";
+    //     // FR3 specifications
+    //     joint_position_max_default = {2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159};
+    //     joint_position_min_default = {-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159};
+    //     // joint_velocity_limits_default = {2, 1, 1.5, 1.25, 3, 1.5, 3};  // FR3 conservative rectangle bounds 
+    //     joint_velocity_limits_default = {3, 3, 3, 3, 3, 3, 3};  // FR3 conservative rectangle bounds 
+    //     joint_torques_limits_default = {87, 87, 87, 87, 12, 12, 12};
+
+    //     // damping gains 
+    //     kv_safety = {15.0, 15.0, 15.0, 10.0, 5.0, 5.0, 5.0};
+
+    //     // zone definitions
+    //     pos_zones = {6., 9.};  
+    //     vel_zones = {6., 8.};
+    // }
+
+    try {
+
+        // RDK Initialization
+        // =========================================================================================
+        // Instantiate robot interface
+        flexiv::Robot robot(robot_sn);
+        // load the kinematics and dynamics model
+        flexiv::Model model(robot);
+
+        // Clear fault on the connected robot if any
+        if (robot.fault()) {
+            log.Warn("Fault occurred on the connected robot, trying to clear ...");
+            // Try to clear the fault
+            if (!robot.ClearFault()) {
+                log.Error("Fault cannot be cleared, exiting ...");
+                return 1;
+            }
+            log.Info("Fault on the connected robot is cleared");
+        }
+
+        // Enable the robot, make sure the E-stop is released before enabling
+        log.Info("Enabling robot ...");
+        robot.Enable();
+
+        // Wait for the robot to become operational
+        while (!robot.operational()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        log.Info("Robot is now operational");
+
+        // Move robot to home pose
+        log.Info("Moving to home pose");
+        robot.SwitchMode(flexiv::Mode::NRT_PRIMITIVE_EXECUTION);
+        robot.ExecutePrimitive("Home()");
+
+        // Wait for the primitive to finish
+        while (robot.busy()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        // // set collision behavior
+        // robot.setCollisionBehavior({{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+        //                             {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+        //                             {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+        //                             {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}});
+
+        // Real-time Control
+        // =========================================================================================
+        // Switch to real-time joint torque control mode
+        robot.SwitchMode(flexiv::Mode::RT_JOINT_TORQUE);
+
+        // Create real-time scheduler to run periodic tasks
+        flexiv::Scheduler scheduler;
+        // Add periodic task with 1ms interval and highest applicable priority
+        scheduler.AddTask(std::bind(PeriodicTask, std::ref(robot), std::ref(model), std::ref(log), std::ref(redis_client)), "HP periodic", 1,
+            scheduler.max_priority());
+        // Start all added tasks
+        scheduler.Start();
+
+        // Block and wait for signal to stop scheduler tasks
+        while (!g_stop_sched) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // Received signal to stop scheduler tasks
+        scheduler.Stop();
+
+    } catch (const std::exception& e) {
+        log.Error(e.what());
+        return 1;
+    }
 
   return 0;
 }
