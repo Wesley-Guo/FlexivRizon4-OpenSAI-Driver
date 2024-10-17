@@ -140,6 +140,16 @@ Eigen::VectorXd hard_min_joint_velocity_limits(7);
 Eigen::VectorXd soft_max_joint_velocity_limits(7);
 Eigen::VectorXd hard_max_joint_velocity_limits(7);
 
+// initial torque bias 
+Eigen::VectorXd init_torque_bias = Eigen::VectorXd::Zero(7);
+int n_samples = 500;
+int n_curr = 0;
+bool initialized_torque_bias = false;
+std::vector<double> kp_holding = {1000, 1000, 1000, 1000, 1000, 1000, 1000};
+std::vector<double> kv_holding = {10, 10, 10, 10, 10, 10, 10};
+Eigen::VectorXd q_init = Eigen::VectorXd::Zero(7);
+bool first_loop = true;
+
 // timing 
 std::clock_t start;
 double duration;
@@ -159,7 +169,7 @@ const std::vector<string> limit_state {"Safe", "Soft Min", "Hard Min", "Soft Max
 
 /** Joint velocity damping gains for floating */
 const std::array<double, flexiv::kJointDOF> kFloatingDamping
-    = {30.0, 30.0, 15.0, 15.0, 3.0, 3.0, 3.0};
+    = {10.0, 10.0, 5.0, 5.0, 1.0, 1.0, 1.0};
 
 /** Atomic signal to stop scheduler tasks */
 std::atomic<bool> g_stop_sched = {false};
@@ -566,6 +576,32 @@ void PeriodicTask(flexiv::Robot& robot, flexiv::Model& model, flexiv::Log& log, 
         // Set 0 joint toruqes
         // std::array<double, flexiv::kJointDOF> target_torque = {};
 
+        // Initialization at the start 
+        if (!initialized_torque_bias) {
+            if (first_loop) {
+                for (int i = 0; i < 7; ++i) {
+                    q_init(i) = robot_state.q[i];
+                }
+            }
+            first_loop = false;
+
+            for (int i = 0; i < 7; ++i) {
+                target_torque[i] = - kp_holding[i] * (robot_state.q[i] - q_init(i)) - kv_holding[i] * robot_state.dq[i];                
+                init_torque_bias(i) += (1. / n_samples) * target_torque[i];
+            }
+
+            if (n_curr > n_samples) { 
+                initialized_torque_bias = true;
+                std::cout << "Initial torque bias: " << init_torque_bias.transpose() << "\n";
+            }
+            n_curr++;
+
+        } else {
+            for (int i = 0; i < 7; ++i) {
+                target_torque[i] += init_torque_bias(i);
+            }
+        }
+
         // Add some velocity damping
         for (size_t i = 0; i < flexiv::kJointDOF; ++i) {
             target_torque[i] += -kFloatingDamping[i] * robot.states().dtheta[i];
@@ -733,9 +769,9 @@ int main (int argc, char** argv) {
         log.Info("Robot is now operational");
 
         // Move robot to home pose
-        log.Info("Moving to home pose");
-        robot.SwitchMode(flexiv::Mode::NRT_PRIMITIVE_EXECUTION);
-        robot.ExecutePrimitive("Home()");
+        // log.Info("Moving to home pose");
+        // robot.SwitchMode(flexiv::Mode::NRT_PRIMITIVE_EXECUTION);
+        // robot.ExecutePrimitive("Home()");
 
         // Wait for the primitive to finish
         while (robot.busy()) {
