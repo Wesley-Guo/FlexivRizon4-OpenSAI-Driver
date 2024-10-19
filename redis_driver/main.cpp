@@ -37,6 +37,7 @@ std::string JOINT_TORQUES_SENSED_KEY;
 std::string MASSMATRIX_KEY;
 std::string CORIOLIS_KEY;
 std::string ROBOT_GRAVITY_KEY;
+std::string WRIST_FORCE_TORQUE_SENSED_KEY;
 std::string SAFETY_TORQUES_LOGGING_KEY;
 std::string SENT_TORQUES_LOGGING_KEY;
 std::string CONSTRAINED_NULLSPACE_KEY;
@@ -62,7 +63,7 @@ std::array<double, 7> joint_velocity_upper_limits;
 std::array<double, 7> joint_velocity_lower_limits;
 std::array<double, 7> joint_torques_limits;
 
-// safety monitoring 
+// workspace safety monitoring 
 const Eigen::Vector3d monitoring_point_ee_frame = Eigen::Vector3d(0.0, 0.0, 0.15);
 const double safety_plane_z_coordinate = 0.28;
 const double safety_cylinder_radius = 0.28;
@@ -89,6 +90,7 @@ std::array<double, 7> tau_cmd_array{};
 std::array<double, 7> q_array{};
 std::array<double, 7> dq_array{};
 std::array<double, 7> tau_sensed_array{};
+std::array<double, 6> wrist_ft_sensed_array{};
 // std::array<double, 7> gravity_vector{};
 // std::array<double, 7> coriolis{};
 // std::array<double, 49> M_array{};  
@@ -210,8 +212,6 @@ void PrintHelp()
     std::cout << "Required arguments: [robot SN]" << std::endl;
     std::cout << "    robot SN: Serial number of the robot to connect to. "
                  "Remove any space, for example: Rizon4s-123456" << std::endl;
-    // std::cout << "Optional arguments: [--hold]" << std::endl;
-    // std::cout << "    --hold: robot holds current joint positions, otherwise do a sine-sweep" << std::endl;
     std::cout << std::endl;
     // clang-format on
 }
@@ -280,29 +280,9 @@ void PeriodicTask(flexiv::Robot& robot, flexiv::Model& model, flexiv::Log& log, 
         sensor_feedback[1] = robot_state.dq;  // non-filtered velocities 
         // sensor_feedback[1] = dq_array;  // filtered velocities
         sensor_feedback[2] = robot_state.tau;
-        // Flexiv returns gravity and coriolis as Eigen::VectorXd objects, map back to std::vector
+        wrist_ft_sensed_array = robot_state.ft_sensor_raw;
         gravity_vector = model.g();
         coriolis  = model.c();
-
-        // compute joint velocity limits at configuration if using FR3 and not using conservative bounds 
-        // if (!USING_PANDA && !USING_CONSERVATIVE_FR3) {
-        //     joint_velocity_lower_limits = getMinJointVelocity(sensor_feedback[0]);
-        //     joint_velocity_upper_limits = getMaxJointVelocity(sensor_feedback[0]);
-        //     for (int i = 0; i < 7; ++i) {
-        //         soft_min_joint_velocity_limits(i) = joint_velocity_lower_limits[i] + pos_zones[1] * vel_tol;
-        //         hard_min_joint_velocity_limits(i) = joint_velocity_lower_limits[i] + pos_zones[0] * vel_tol;
-        //         soft_max_joint_velocity_limits(i) = joint_velocity_upper_limits[i] - pos_zones[1] * vel_tol;
-        //         hard_max_joint_velocity_limits(i) = joint_velocity_upper_limits[i] - pos_zones[0] * vel_tol;
-                
-        //         // // specific value for last joint
-        //         // if (i == 6) {
-        //         //     soft_min_joint_velocity_limits(i) += 4.5 * vel_tol;
-        //         //     hard_min_joint_velocity_limits(i) += 4.5 * vel_tol;
-        //         //     soft_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
-        //         //     hard_max_joint_velocity_limits(i) -= 4.5 * vel_tol;
-        //         // }
-        //     }
-        // }
 
         MassMatrix = model.M();
         Eigen::Map<Eigen::Matrix<double, 7, 1>> _tau(tau_cmd_array.data());
@@ -311,8 +291,12 @@ void PeriodicTask(flexiv::Robot& robot, flexiv::Model& model, flexiv::Log& log, 
         Eigen::MatrixXd MassMatrixInverse = MassMatrix.llt().solve(Eigen::MatrixXd::Identity(7, 7));
 
         redis_client->setGetBatchCommands(key_names, tau_cmd_array, MassMatrix, sensor_feedback);
+        if (USING_4S) {
+            redis_client->setDoubleArray(WRIST_FORCE_TORQUE_SENSED_KEY, wrist_ft_sensed_array, 6);
+        }
         redis_client->setEigenMatrixDerived(ROBOT_GRAVITY_KEY, gravity_vector);
         redis_client->setEigenMatrixDerived(CORIOLIS_KEY, coriolis);
+
 
         // reset containers
         _limited_joints.setZero();  // used to form the constraint jacobian 
@@ -496,32 +480,32 @@ void PeriodicTask(flexiv::Robot& robot, flexiv::Model& model, flexiv::Log& log, 
                 std::cout << "), saturating to min value(" << -joint_torques_limits[i] << ")" << std::endl;
                 tau_cmd_array[i] = -joint_torques_limits[i];
             }
-            // // position limit
-            // if(robot_state.q[i] > joint_position_max[i])
-            // {
-            //     safety_mode_flag = true;
-            //     if(safety_controller_count == 200)
-            //     {
-            //     std::cout << "WARNING : Soft joint upper limit violated on joint " << i << ", engaging safety mode" << std::endl;
-            //     }
-            // }
-            // if(robot_state.q[i] < joint_position_min[i])
-            // {
-            //     safety_mode_flag = true;
-            //     if(safety_controller_count == 200)
-            //     {
-            //     std::cout << "WARNING : Soft joint lower limit violated on joint " << i << ", engaging safety mode" << std::endl;
-            //     }
-            // }
-            // // velocity limit
-            // if(abs(robot_state.dq[i]) > joint_velocity_limits[i])
-            // {
-            //     safety_mode_flag = true;
-            //     if(safety_controller_count == 200)
-            //     {
-            //     std::cout << "WARNING : Soft velocity limit violated on joint " << i << ", engaging safety mode" << std::endl;
-            //     }
-            // }
+            // position limit
+            if(robot_state.q[i] > joint_position_max[i])
+            {
+                safety_mode_flag = true;
+                if(safety_controller_count == 200)
+                {
+                std::cout << "WARNING : Soft joint upper limit violated on joint " << i << ", engaging safety mode" << std::endl;
+                }
+            }
+            if(robot_state.q[i] < joint_position_min[i])
+            {
+                safety_mode_flag = true;
+                if(safety_controller_count == 200)
+                {
+                std::cout << "WARNING : Soft joint lower limit violated on joint " << i << ", engaging safety mode" << std::endl;
+                }
+            }
+            // velocity limit
+            if(abs(robot_state.dq[i]) > joint_velocity_limits[i])
+            {
+                safety_mode_flag = true;
+                if(safety_controller_count == 200)
+                {
+                std::cout << "WARNING : Soft velocity limit violated on joint " << i << ", engaging safety mode" << std::endl;
+                }
+            }
         }
 
         // if (safety_enabled) {
@@ -568,8 +552,6 @@ void PeriodicTask(flexiv::Robot& robot, flexiv::Model& model, flexiv::Log& log, 
                 "PeriodicTask: Fault occurred on the connected robot, exiting ...");
         }
 
-        // std::cout << "Before Setting Target Torques\n" << "\n";
-
         // Set joint torques to command torques from Redis
         std::array<double, flexiv::kJointDOF> target_torque = tau_cmd_array;
 
@@ -608,13 +590,9 @@ void PeriodicTask(flexiv::Robot& robot, flexiv::Model& model, flexiv::Log& log, 
             // std::cout << target_torque[i] << "\n";
         }
 
-        // std::cout << "After Setting Target Torques\n" << "\n";
-
         // Send target joint torque to RDK server, enable gravity compensation and joint limits soft
         // protection
         robot.StreamJointTorque(target_torque, true, true);
-
-        // std::cout << "After Sending Target Torques\n" << "\n";
 
         counter++;
 
@@ -647,16 +625,20 @@ int main (int argc, char** argv) {
     robot_id["Rizon4s_062232"] = "4S-Oberon";
     // robot_id["172.16.0.11"] = "Juliet";
 
-    JOINT_TORQUES_COMMANDED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::actuators::fgc";
-    JOINT_ANGLES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::q";
-    JOINT_VELOCITIES_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::dq";
-    JOINT_TORQUES_SENSED_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::torques";
-    MASSMATRIX_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::massmatrix";
-    CORIOLIS_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::coriolis";
-    ROBOT_GRAVITY_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::robot_gravity";
-    SAFETY_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::safety_torques";
-    SENT_TORQUES_LOGGING_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::sent_torques";
-    CONSTRAINED_NULLSPACE_KEY = "sai2::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::constraint_nullspace";
+    JOINT_TORQUES_COMMANDED_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::actuators::fgc";
+    JOINT_ANGLES_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::q";
+    JOINT_VELOCITIES_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::dq";
+    JOINT_TORQUES_SENSED_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::torques";
+    MASSMATRIX_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::massmatrix";
+    CORIOLIS_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::coriolis";
+    ROBOT_GRAVITY_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::robot_gravity";
+    SAFETY_TORQUES_LOGGING_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::safety_torques";
+    SENT_TORQUES_LOGGING_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::safety::sent_torques";
+    CONSTRAINED_NULLSPACE_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::model::constraint_nullspace";
+
+    if (USING_4S) {
+        WRIST_FORCE_TORQUE_SENSED_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::wrist_FT";
+    }
 
     // start redis client
     CDatabaseRedisClient* redis_client;
@@ -666,13 +648,6 @@ int main (int argc, char** argv) {
     info.timeout_ = { 1, 500000 }; // 1.5 seconds
     redis_client = new CDatabaseRedisClient();
     redis_client->serverIs(info);
-
-    // // set up signal handler
-    // signal(SIGABRT, &sighandler);
-    // signal(SIGTERM, &sighandler);
-    // signal(SIGINT, &sighandler);
-
-    // debug_function(redis_client);
 
     for (int i = 0; i < 7; ++i) {
         tau_cmd_array[i] = 0;
@@ -695,14 +670,10 @@ int main (int argc, char** argv) {
     key_names.push_back(JOINT_ANGLES_KEY);
     key_names.push_back(JOINT_VELOCITIES_KEY);
     key_names.push_back(JOINT_TORQUES_SENSED_KEY);
-    // key_names.push_back(ROBOT_GRAVITY_KEY);
-    // key_names.push_back(CORIOLIS_KEY);
 
     sensor_feedback.push_back(q_array);
     sensor_feedback.push_back(dq_array);
     sensor_feedback.push_back(tau_sensed_array);
-    // sensor_feedback.push_back(gravity_vector);
-    // sensor_feedback.push_back(coriolis);
 
     if (USING_4S) {
         std::cout << "Using Rizon 4s specifications\n";
@@ -768,21 +739,26 @@ int main (int argc, char** argv) {
         }
         log.Info("Robot is now operational");
 
-        // Move robot to home pose
-        // log.Info("Moving to home pose");
-        // robot.SwitchMode(flexiv::Mode::NRT_PRIMITIVE_EXECUTION);
-        // robot.ExecutePrimitive("Home()");
+        // Zero Force-torque Sensors
+        // =========================================================================================
+        // IMPORTANT: must zero force/torque sensor offset for accurate force/torque measurement
+        robot.SwitchMode(flexiv::Mode::NRT_PRIMITIVE_EXECUTION);
+        robot.ExecutePrimitive("ZeroFTSensor()");
+ 
+        // WARNING: during the process, the robot must not contact anything, otherwise the result
+        // will be inaccurate and affect following operations
+        log.Info("Zeroing force/torque sensors, make sure nothing is in contact with the robot");
+ 
+        // Wait for primitive completion
+        while (robot.busy()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        log.Info("Sensor zeroing complete");
 
         // Wait for the primitive to finish
         while (robot.busy()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-
-        // // set collision behavior
-        // robot.setCollisionBehavior({{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
-        //                             {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
-        //                             {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
-        //                             {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}});
 
         // Real-time Control
         // =========================================================================================
