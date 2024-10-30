@@ -56,9 +56,15 @@
         "streambuf": "cpp",
         "thread": "cpp",
         "cinttypes": "cpp",
-        "typeinfo": "cpp"
+        "typeinfo": "cpp",
+        "compare": "cpp",
+        "concepts": "cpp",
+        "list": "cpp",
+        "numbers": "cpp",
+        "semaphore": "cpp",
+        "stop_token": "cpp"
     }, 
     "cmake.configureSettings": {
-        "CMAKE_INSTALL_PREFIX":"~/rdk_install"
+        "CMAKE_INSTALL_PREFIX":"~/rdk_install_flexiv"
     }
 }
