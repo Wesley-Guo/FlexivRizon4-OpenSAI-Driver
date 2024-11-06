@@ -31,6 +31,7 @@
 // - read:
 std::string JOINT_TORQUES_COMMANDED_KEY;
 std::string GRIPPER_PARAMETERS_COMMANDED_KEY;
+std::string GRIPPER_MODE_KEY;
 // - write:
 std::string JOINT_ANGLES_KEY;
 std::string JOINT_VELOCITIES_KEY;
@@ -109,7 +110,9 @@ std::vector<string> key_names;
 // gripper command storage
 Eigen::Vector3d gripper_parameters =
     Eigen::Vector3d(0.06, 0.1, 10.0); // width in m, speed in m/s, force in N
-Eigen::Vector3d last_gripper_parameters = Eigen::Vector3d(0.06, 0.1, 10.0);
+Eigen::Vector3d last_gripper_parameters = gripper_parameters;
+string gripper_mode = "o";
+string last_gripper_mode = gripper_mode;
 double gripper_width;
 double gripper_speed;
 double gripper_force;
@@ -280,16 +283,31 @@ void PeriodicTask(flexiv::Robot &robot, flexiv::Gripper &gripper,
         redis_client->getEigenMatrixDerivedString(
             GRIPPER_PARAMETERS_COMMANDED_KEY, gripper_parameters);
 
-        if ((gripper_parameters - last_gripper_parameters).norm() > 0.01) {
-            gripper_width = gripper_parameters(0);
-            gripper_speed = gripper_parameters(1);
-            gripper_force = gripper_parameters(2);
-            log.Info(
-                "Moving Gripper - Width: " + std::to_string(gripper_width) +
-                "m    Speed: " + std::to_string(gripper_speed) +
-                "m/s    Force: " + std::to_string(gripper_force) + "N");
-            gripper.Move(gripper_width, gripper_width, gripper_force);
-            last_gripper_parameters = gripper_parameters;
+        redis_client->getCommandIs(GRIPPER_MODE_KEY, gripper_mode);
+
+        // if ((gripper_parameters - last_gripper_parameters).norm() > 0.01) {
+        //     gripper_width = gripper_parameters(0);
+        //     gripper_speed = gripper_parameters(1);
+        //     gripper_force = gripper_parameters(2);
+        //     log.Info(
+        //         "Moving Gripper - Width: " + std::to_string(gripper_width) +
+        //         "m    Speed: " + std::to_string(gripper_speed) +
+        //         "m/s    Force: " + std::to_string(gripper_force) + "N");
+        //     gripper.Move(gripper_width, gripper_speed, gripper_force);
+        //     last_gripper_parameters = gripper_parameters;
+        // }
+
+        if (gripper_mode != last_gripper_mode) {
+            if (gripper_mode == "g") {
+                log.Info("Closing Gripper");
+                gripper.Move(0, 0.1, 80);
+            } else if (gripper_mode == "o") {
+                log.Info("Opening Gripper");
+                gripper.Move(0.05, 0.1, 80);
+            } else {
+                log.Info("Invalid Gripper Command");
+            }
+            last_gripper_mode = gripper_mode;
         }
 
         for (int i = 0; i < 7; ++i) {
@@ -786,6 +804,8 @@ int main(int argc, char **argv) {
     GRIPPER_PARAMETERS_COMMANDED_KEY =
         "OpenSai::FlexivRizon::" + robot_id[robot_sn] +
         "::actuators::gripper::parameters";
+    GRIPPER_MODE_KEY = "OpenSai::FlexivRizon::" + robot_id[robot_sn] +
+                       "::actuators::gripper::mode";
     JOINT_ANGLES_KEY =
         "OpenSai::FlexivRizon::" + robot_id[robot_sn] + "::sensors::q";
     JOINT_VELOCITIES_KEY =
@@ -838,6 +858,7 @@ int main(int argc, char **argv) {
 
     redis_client->setEigenMatrixDerivedString(GRIPPER_PARAMETERS_COMMANDED_KEY,
                                               gripper_parameters);
+    redis_client->setCommandIs(GRIPPER_MODE_KEY, "o");
 
     // prepare batch command
     key_names.push_back(JOINT_TORQUES_COMMANDED_KEY);
